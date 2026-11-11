@@ -2852,6 +2852,51 @@ cmd_apply() {
     apply_config "$url" "$branch" "$fork" "apply"
 }
 
+# memory_ceiling_gb — host MemAvailable, lowered by cgroup memory.max if lower.
+# Prints a number (GiB) or empty when unreadable.
+memory_ceiling_gb() {
+    local host_gb="" cgroup_bytes="" cgroup_gb=""
+    host_gb="$(awk '/MemAvailable:/ {printf "%.1f", $2/1048576}' /proc/meminfo 2>/dev/null || true)"
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+        cgroup_bytes="$(< /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+    fi
+    if [[ -n "$cgroup_bytes" && "$cgroup_bytes" != "max" && "$cgroup_bytes" =~ ^[0-9]+$ ]]; then
+        cgroup_gb="$(awk -v b="$cgroup_bytes" 'BEGIN{printf "%.1f", b/1073741824}')"
+    fi
+    if [[ -n "$cgroup_gb" ]]; then
+        if [[ -z "$host_gb" ]]; then
+            host_gb="$cgroup_gb"
+        elif awk -v a="$cgroup_gb" -v b="$host_gb" 'BEGIN{exit !(a < b)}'; then
+            host_gb="$cgroup_gb"
+        fi
+    fi
+    printf '%s' "$host_gb"
+}
+
+# compute_build_jobs <mem_avail_gb> <cpu_count>
+#
+# Adaptive build parallelism for `cmake --build build` (no -j), which ninja
+# would otherwise run at one job per core. Qt6 precompiled-header compilation
+# at -O3 is memory-heavy, so jobs are capped by available memory.
+#
+# ~2.5 GiB reserved per concurrent cc1plus job is a conservative heuristic,
+# NOT a measured value. Clamp to [1, cpu_count]: 1 job on tiny VMs, full
+# parallelism on big boxes.
+#
+# Prints a single positive integer to stdout.
+compute_build_jobs() {
+    local mem_avail_gb="$1" cpu_count="$2" jobs
+    if [[ -n "$mem_avail_gb" && "$mem_avail_gb" != "0" && "$mem_avail_gb" != "0.0" ]]; then
+        jobs="$(awk -v m="$mem_avail_gb" -v n="$cpu_count" \
+            'BEGIN{j=m/2.5; if(j<1)j=1; if(j>n)j=n; printf "%d", j}')"
+    else
+        # No readable memory info: use half the cores, minimum 1.
+        jobs="$(awk -v n="$cpu_count" 'BEGIN{j=n/2; if(j<1)j=1; printf "%d", j}')"
+    fi
+    [[ "$jobs" =~ ^[0-9]+$ ]] || jobs=1
+    printf '%d' "$jobs"
+}
+
 cmd_install() {
     load_local_src
 
@@ -2909,6 +2954,39 @@ cmd_install() {
         return 1
     fi
     chmod +x "$CLONE_DIR/setup"
+
+    # --- adaptive build parallelism -------------------------------------
+    # The base installer builds illogical-impulse-quickshell-git with
+    # `cmake --build build` (no -j), so ninja would spawn one cc1plus per
+    # core. Qt6 precompiled-header compilation at -O3 is memory-heavy and has
+    # killed the compiler (OOM) on low-RAM VMs. Cap jobs by available memory.
+    #
+    # Precedence (highest first):
+    #   1. II_BUILD_JOBS            user override, positive integer required
+    #   2. CMAKE_BUILD_PARALLEL_LEVEL   already exported by the user; kept
+    #   3. computed from memory + CPU (compute_build_jobs)
+    #
+    # The export lives in this shell process, so it is also visible to
+    # ensure_quickshell_git below, which may build quickshell-git from the
+    # AUR via yay/paru (same OOM risk).
+    local cpu_count mem_gb build_jobs=""
+    cpu_count="$(nproc)"
+    mem_gb="$(memory_ceiling_gb)"
+    if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+        if [[ -n "${II_BUILD_JOBS:-}" && "${II_BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+            build_jobs="$II_BUILD_JOBS"
+        elif [[ -n "${II_BUILD_JOBS:-}" ]]; then
+            ui_warn "II_BUILD_JOBS='$II_BUILD_JOBS' is not a positive integer; ignoring."
+        fi
+    fi
+    if [[ -z "${build_jobs}" ]]; then
+        build_jobs="$(compute_build_jobs "$mem_gb" "$cpu_count")"
+    fi
+    if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+        export CMAKE_BUILD_PARALLEL_LEVEL="$build_jobs"
+    fi
+    ui_info "Build parallelism: ${CMAKE_BUILD_PARALLEL_LEVEL} jobs (nproc=${cpu_count}, MemAvailable=${mem_gb:-unknown} GiB; override with II_BUILD_JOBS)"
+    # ---------------------------------------------------------------------
 
     ui_info "Handing over to ./setup install — its own output follows."
     printf '\n'
