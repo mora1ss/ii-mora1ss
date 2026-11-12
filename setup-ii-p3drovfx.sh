@@ -861,7 +861,16 @@ on_exit() {
 
     [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
     [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]] && rm -rf "$STAGE_DIR"
-    [[ -n "$CLONE_DIR" && -d "$CLONE_DIR" ]] && rm -rf "$CLONE_DIR"
+    if [[ -n "$CLONE_DIR" && -d "$CLONE_DIR" ]]; then
+        if ((rc == 0)); then
+            rm -rf "$CLONE_DIR"
+        else
+            local clone_size=""
+            clone_size="$(du -sh "$CLONE_DIR" 2>/dev/null | cut -f1 || printf '?')"
+            ui_warn "Build tree kept for inspection: $(tilde "$CLONE_DIR") (${clone_size})"
+            ui_note "Remove it later with: rm -rf $(tilde "$CLONE_DIR")"
+        fi
+    fi
     return "$rc"
 }
 
@@ -2897,6 +2906,105 @@ compute_build_jobs() {
     printf '%d' "$jobs"
 }
 
+# is_tmpfs_path <path> — true if the filesystem holding <path> is tmpfs or ramfs.
+# Uses findmnt, falls back to stat, then df. Returns 1 when unreadable.
+is_tmpfs_path() {
+    local path="$1" fstype="" parent=""
+    [[ -n "$path" ]] || return 1
+    if [[ ! -e "$path" ]]; then
+        parent="$(dirname "$path")"
+        [[ -e "$parent" ]] || return 1
+        path="$parent"
+    fi
+    if command -v findmnt >/dev/null 2>&1; then
+        fstype="$(findmnt -no FSTYPE -T "$path" 2>/dev/null || true)"
+    fi
+    if [[ -z "$fstype" ]] && command -v stat >/dev/null 2>&1; then
+        fstype="$(stat -f -c %T "$path" 2>/dev/null || true)"
+    fi
+    if [[ -z "$fstype" ]] && command -v df >/dev/null 2>&1; then
+        fstype="$(df -T "$path" 2>/dev/null | awk 'NR==2{print $1}' || true)"
+    fi
+    [[ "$fstype" == "tmpfs" || "$fstype" == "ramfs" ]]
+}
+
+# free_space_gb <path> — free GiB on the filesystem holding <path>.
+# Walks up to the nearest existing parent so it works for not-yet-created paths.
+# Prints a number (one decimal) or returns 1 when unreadable.
+free_space_gb() {
+    local path="$1" target="" avail_kb=""
+    [[ -n "$path" ]] || return 1
+    target="$path"
+    while [[ ! -e "$target" && "$target" != "/" ]]; do
+        target="$(dirname "$target")"
+    done
+    avail_kb="$(df -Pk "$target" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+    [[ -n "$avail_kb" && "$avail_kb" =~ ^[0-9]+$ ]] || return 1
+    awk -v k="$avail_kb" 'BEGIN{printf "%.1f", k/1048576}'
+}
+
+# choose_build_tmpdir — pick a real-disk root for the base-installer clone and
+# build, so a small tmpfs /tmp cannot fill up and kill the build mid-way.
+#
+# Precedence (highest first):
+#   1. II_BUILD_TMPDIR        explicit user path (must be writable + enough space)
+#   2. $TMPDIR (/tmp)         only if NOT tmpfs/ramfs AND enough space
+#   3. $XDG_CACHE_HOME/.../build
+#   4. /var/tmp
+#   5. $HOME/.local/share/ii-p3drovfx/build
+#
+# Required free space: II_MIN_BUILD_GB (default 15 GiB) — a conservative
+# heuristic for the quickshell build tree plus the clone, NOT a measured value.
+# Prints the chosen directory to stdout, or returns 1 with a clear error.
+choose_build_tmpdir() {
+    local min_gb="${II_MIN_BUILD_GB:-15}" chosen="" fs_type="" free_gb=""
+    local -a candidates=()
+    local cur_tmp="${TMPDIR:-/tmp}" c
+
+    if [[ -n "${II_BUILD_TMPDIR:-}" ]]; then
+        # Explicit override: respect user intent (validate writable + space).
+        candidates=("${II_BUILD_TMPDIR}")
+    else
+        candidates+=("$cur_tmp")
+        candidates+=(
+            "${XDG_CACHE_HOME:-$HOME/.cache}/ii-p3drovfx/build"
+            "/var/tmp"
+            "${HOME:-$HOME}/.local/share/ii-p3drovfx/build"
+        )
+    fi
+
+    for c in "${candidates[@]}"; do
+        [[ -n "$c" ]] || continue
+        # Must be creatable and writable.
+        if ! mkdir -p "$c" 2>/dev/null || [[ ! -w "$c" ]]; then
+            continue
+        fi
+        # The explicit override and the fallback list must live on real disk;
+        # the current TMPDIR is also rejected when it is tmpfs/ramfs.
+        if [[ -z "${II_BUILD_TMPDIR:-}" ]] && is_tmpfs_path "$c"; then
+            continue
+        fi
+        free_gb="$(free_space_gb "$c")" || continue
+        if awk -v f="$free_gb" -v m="$min_gb" 'BEGIN{exit !(f >= m)}'; then
+            chosen="$c"
+            fs_type="$(df -T "$c" 2>/dev/null | awk 'NR==2{print $1}' || printf 'unknown')"
+            break
+        fi
+    done
+
+    if [[ -z "$chosen" ]]; then
+        ui_fail "No suitable build directory" \
+            "need at least ${min_gb} GiB free on a non-tmpfs filesystem"
+        ui_note "Candidates considered: ${candidates[*]}"
+        ui_note "Override with II_BUILD_TMPDIR=<path> or II_MIN_BUILD_GB=<n>"
+        return 1
+    fi
+
+    CHOSEN_FS_TYPE="$fs_type"
+    CHOSEN_FREE_GB="$free_gb"
+    printf '%s' "$chosen"
+}
+
 cmd_install() {
     load_local_src
 
@@ -2947,7 +3055,45 @@ cmd_install() {
     # Once, up front: the base installer, the Quickshell swap and the core
     # dependencies all need it, and would otherwise each ask on their own.
     sudo_prime || true
-    CLONE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ii-base-XXXXXX")"
+
+    # --- choose a real-disk build root (avoid filling a small tmpfs /tmp) ----
+    # makepkg builds inside the PKGBUILD directory (srcdir) unless BUILDDIR is
+    # set, and /etc/makepkg.conf leaves BUILDDIR commented out
+    # (/etc/makepkg.conf:80).  So the whole quickshell build tree lands under
+    # CLONE_DIR.  By default that is /tmp, which on CachyOS and many other
+    # distros is a small tmpfs (half of RAM) and fills up long before the build
+    # finishes.  Pick a real-disk root, export TMPDIR so every child (setup,
+    # yay, makepkg, uv, tar, mktemp) inherits it, and fail early with a clear
+    # message instead of dying 900 steps into the build.
+    #
+    # BUILDDIR is deliberately NOT exported here: although makepkg honors it
+    # when the conf does not set it, builds already happen in srcdir under
+    # CLONE_DIR (now on real disk), and exporting a shared BUILDDIR risks
+    # cross-package build-directory clashes.  Only TMPDIR is exported.
+    local chosen_tmp="" tmp_free_gb="" tmp_clause=""
+    chosen_tmp="$(choose_build_tmpdir)" || return 1
+    tmp_free_gb="$(free_space_gb "/tmp" 2>/dev/null || printf 'unknown')"
+    if is_tmpfs_path "/tmp"; then
+        tmp_clause="; /tmp is tmpfs with ${tmp_free_gb:-unknown} GiB"
+    fi
+    CLONE_DIR="$(mktemp -d -p "$chosen_tmp" ii-base-XXXXXX)" || {
+        ui_fail "Temp dir" "could not create build directory under $(tilde "$chosen_tmp")"
+        return 1
+    }
+    export TMPDIR="$chosen_tmp"
+    ui_info "Build directory: ${CLONE_DIR} (${CHOSEN_FS_TYPE:-unknown}, ${CHOSEN_FREE_GB:-unknown} GiB free${tmp_clause})"
+
+    # Warn about stale ii-base-* leftovers; never delete them automatically.
+    local -a stale=() s
+    mapfile -t stale < <(find "$chosen_tmp" /tmp -maxdepth 1 -name 'ii-base-*' -type d 2>/dev/null | sort || true)
+    for s in "${stale[@]}"; do
+        [[ -n "$s" ]] || continue
+        [[ "$s" == "$CLONE_DIR" ]] && continue
+        local s_size=""
+        s_size="$(du -sh "$s" 2>/dev/null | cut -f1 || printf '?')"
+        ui_warn "Stale build tree: $(tilde "$s") (${s_size}) — rm -rf $(tilde "$s")"
+    done
+
     clone_repo "$BASE_INSTALLER_URL" "$BASE_INSTALLER_BRANCH" "$CLONE_DIR" || return 1
     if [[ ! -f "$CLONE_DIR/setup" ]]; then
         ui_fail "No base installer" "${BASE_INSTALLER_URL#https://} has no ./setup"
